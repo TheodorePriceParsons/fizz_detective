@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+install/
+log/
+training/data/*
+!training/data/.gitkeep
+*.h5
+*.keras
+*.pt
+!controller_pkg/models/*.keras
+!controller_pkg/models/*.pt
+*.txt
+!requirements.txt
+.vscode/
