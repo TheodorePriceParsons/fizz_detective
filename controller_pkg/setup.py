@@ -15,5 +15,8 @@ setup(
     zip_safe=True,
     entry_points={'console_scripts': [
         'time_trial = controller_pkg.time_trial:main',
+        'il_logger = controller_pkg.il_logger:main',
+        'driver = controller_pkg.driver:main',
     ]},
+
 )
