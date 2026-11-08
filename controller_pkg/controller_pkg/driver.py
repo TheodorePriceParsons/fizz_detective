@@ -53,9 +53,22 @@ class Driver(Node):
             'veh_v_max': 35,      # 'very dark' pixels = vehicle (truck body/tyres are near-black)
             'veh_frac': 0.03,     # fraction of the look-ahead box that must be very dark to stop
             'veh_top': 0.6,       # top of the look-ahead box (fraction of image height); keep below the horizon/tree line
-            'veh_clear': 1.0,
+            'veh_min_h': 0.25,    # biggest dark blob must be at least this fraction of the box height (trees are a thin strip)
+            'veh_clear': 1.0,     # box must stay clear this long (s) before driving on
             'veh_max_wait': 10.0, # never sit in WAIT_VEHICLE longer than this
-     # box must stay clear this long (s) before driving on
+            # pedestrian (robot is stopped at the crosswalk, so moving pixels = pedestrian)
+            'ped_min_area': 0.002,  # moving blob must cover this fraction of the image to count as the pedestrian
+            'ped_side': 0.2,        # 'middle' band half-width (fraction of image width): inside = in front of the robot
+            # clue boards (blue frame) as landmarks
+            'board_frac': 0.01,     # blue must cover this fraction of the image for a board to count as 'passing'
+            # truck: wait at the T junction, then follow it
+            'truck_after_board': 2, # start waiting for the truck once this many boards have gone by (0 = never)
+            'truck_delay': 0.0,     # seconds of PID after that board before stopping (creep up to the T)
+            'truck_wait_max': 25.0, # give up waiting for the truck after this (one truck lap is ~14 s)
+            'follow_speed': 0.4,    # keep below the truck's 0.5 m/s
+            'follow_kp': 1.5,       # steering gain toward the truck
+            'truck_close': 0.8,     # stop if the truck's bottom edge is below this fraction of the image (too close)
+            'truck_lost': 1.5,      # truck out of sight this long (s) -> back to PID
         }
         for k, v in defaults.items():
             self.declare_parameter(k, v)
@@ -74,6 +87,11 @@ class Driver(Node):
         self.veh_wait_start = 0.0
         self.seen_motion = False
         self.prev_gray = None
+        self.ped_x, self.ped_status, self.ped_crossed = None, '', False
+        self.boards, self.board_on, self.board_off = 0, 0, 0
+        self.board_visible = False
+        self.truck_trigger_t, self.truck_done = None, False
+        self.truck_last_seen, self.truck_info = 0.0, ''
         self.writer, self.out, self.n = None, None, 0
 
         self.cmd = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -123,12 +141,24 @@ class Driver(Node):
                 self.purple_frames, self.ignore_purple_until = 0, t + 3.0
                 self.get_logger().info(f'purple line -> section {self.section}: {self.mode()}')
 
+        self.count_boards(hsv)
+
+        # Truck: after board N, creep for truck_delay s, then stop at the T and wait for the truck.
+        if (not self.truck_done and self.truck_trigger_t is None and self.p('truck_after_board') > 0
+                and self.boards >= self.p('truck_after_board')):
+            self.truck_trigger_t = t
+            self.get_logger().info(f'board {self.boards} passed: truck section')
+        if (self.state == 'DRIVE' and self.mode() == 'pid' and self.truck_trigger_t is not None
+                and not self.truck_done and t - self.truck_trigger_t > self.p('truck_delay')):
+            self.state, self.wait_start = 'WAIT_TRUCK', t
+            self.get_logger().info('at the T: waiting for the truck')
+
         # Red crosswalk line (only while PID is driving).
         # (also overrides WAIT_VEHICLE: the pedestrian's dark clothes can trip the vehicle check first)
         if self.state in ('DRIVE', 'WAIT_VEHICLE') and self.mode() == 'pid' and red and not crossing:
             self.state = 'WAIT_PED'
             self.wait_start = self.last_motion = t
-            self.seen_motion, self.prev_gray = False, None
+            self.seen_motion, self.prev_gray, self.ped_x, self.ped_crossed = False, None, None, False
             self.get_logger().info('crosswalk: waiting for pedestrian')
 
         # Vehicle close ahead (only while PID is driving, and not already waiting for the pedestrian).
@@ -137,7 +167,9 @@ class Driver(Node):
             self.state, self.veh_clear_since, self.veh_wait_start = 'WAIT_VEHICLE', None, t
             self.get_logger().info('vehicle ahead: stopping')
 
-        if self.state == 'WAIT_VEHICLE':
+        if self.state in ('WAIT_TRUCK', 'FOLLOW_TRUCK'):
+            tw = self.truck_step(hsv, frame, t)
+        elif self.state == 'WAIT_VEHICLE':
             tw = Twist()
             if vehicle:
                 self.veh_clear_since = None
@@ -195,32 +227,132 @@ class Driver(Node):
         return tw
 
     def vehicle_ahead(self, hsv, frame):
-        """Look-ahead box in the middle of the road. The truck is mostly near-black and
-        low saturation; road (~77), grass and sand are all brighter or saturated."""
+        """Truck = one big, solid, near-black blob in the look-ahead box.
+        Background trees only make small specks / a thin strip along the top of the box,
+        so keep just the biggest connected blob and require it to be big AND tall."""
         h, w = hsv.shape[:2]
         y1, y2, x1, x2 = int(self.p('veh_top') * h), int(self.p('strip') * h), int(0.2 * w), int(0.8 * w)
-        box = hsv[y1:y2, x1:x2]
-        dark = (box[..., 2] <= self.p('veh_v_max')) & (box[..., 1] <= 80)
-        frame[y1:y2, x1:x2][dark] = (0, 0, 255)  # debug: dark pixels painted red
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
-        return dark.mean() > self.p('veh_frac')
+        box = hsv[y1:y2, x1:x2]
+        dark = ((box[..., 2] <= self.p('veh_v_max')) & (box[..., 1] <= 80)).astype(np.uint8)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # wipe out single specks
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        if n <= 1:  # label 0 is the background, so no blobs at all
+            return False
+        i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))  # biggest blob
+        frame[y1:y2, x1:x2][labels == i] = (0, 0, 255)       # debug: biggest blob painted red
+        big = stats[i, cv2.CC_STAT_AREA] > self.p('veh_frac') * dark.size
+        tall = stats[i, cv2.CC_STAT_HEIGHT] > self.p('veh_min_h') * dark.shape[0]
+        return bool(big and tall)
 
     def pedestrian_clear(self, frame, t):
-        """Robot is stopped, so anything changing between frames is an NPC moving.
-        The pedestrian walks across, pauses ~2 s on each side, walks back.
-        Go right after we've seen it move and then stop (start of a pause)."""
+        """Robot is stopped, so pixels that change between frames = the pedestrian moving.
+        Wait until he has walked ACROSS in front of us (seen in the middle band), then go the
+        moment he leaves the middle on the far side. That starts the crossing with his whole
+        'walk to the side + 2 s pause + walk back' window ahead of us."""
         gray = cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        h, w = gray.shape
         if self.prev_gray is not None:
-            diff = cv2.absdiff(gray, self.prev_gray)
-            moving = cv2.countNonZero((diff > 25).astype(np.uint8)) > 0.003 * diff.size
-            if moving:
-                self.seen_motion, self.last_motion = True, t
+            motion = (cv2.absdiff(gray, self.prev_gray) > 25).astype(np.uint8)
+            motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            n, labels, stats, cents = cv2.connectedComponentsWithStats(motion, connectivity=8)
+            if n > 1:
+                i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                if stats[i, cv2.CC_STAT_AREA] > self.p('ped_min_area') * motion.size:
+                    self.seen_motion, self.last_motion, self.ped_x = True, t, float(cents[i][0])
+                    x, y, bw, bh = (int(v) for v in stats[i, :4])
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 255), 2)  # debug: pedestrian box
         self.prev_gray = gray
+
+        band = self.p('ped_side') * w
+        middle = self.ped_x is not None and abs(self.ped_x - w / 2) <= band
+        if middle:
+            self.ped_crossed = True  # he is walking in front of us right now
+        cv2.line(frame, (int(w / 2 - band), 0), (int(w / 2 - band), h), (255, 0, 255), 1)  # middle band edges
+        cv2.line(frame, (int(w / 2 + band), 0), (int(w / 2 + band), h), (255, 0, 255), 1)
+        if not self.seen_motion:
+            self.ped_status = 'ped: not seen'
+        elif middle:
+            self.ped_status = 'ped: IN FRONT'
+        else:
+            self.ped_status = 'ped: side, passed' if self.ped_crossed else 'ped: side, waiting for him to cross'
+
         waited = t - self.wait_start
         if waited > self.p('max_wait'):
             self.get_logger().warn('pedestrian wait timed out, going anyway')
             return True
-        return waited > 0.5 and self.seen_motion and t - self.last_motion > 0.3
+        return self.ped_crossed and self.ped_x is not None and not middle
+
+    def count_boards(self, hsv):
+        """Clue boards have a saturated blue frame. Count one each time a big blue patch
+        has been in view (3+ frames) and then leaves view (5+ frames)."""
+        blue = cv2.inRange(hsv, (105, 150, 50), (130, 255, 255))
+        now = cv2.countNonZero(blue) > self.p('board_frac') * blue.size
+        self.board_on = self.board_on + 1 if now else 0
+        self.board_off = self.board_off + 1 if not now else 0
+        if not self.board_visible and self.board_on >= 3:
+            self.board_visible = True
+        elif self.board_visible and self.board_off >= 5:
+            self.board_visible = False
+            self.boards += 1
+            self.get_logger().info(f'passed clue board #{self.boards}')
+
+    def find_truck(self, hsv, frame):
+        """Biggest near-black blob below the horizon. Returns (centre_x, bottom_y, height) or None."""
+        h, w = hsv.shape[:2]
+        y1, y2 = int(0.35 * h), int(self.p('strip') * h)
+        reg = hsv[y1:y2]
+        dark = ((reg[..., 2] <= self.p('veh_v_max')) & (reg[..., 1] <= 80)).astype(np.uint8)
+        dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        best = None
+        for i in range(1, n):
+            x, y, bw, bh, area = (int(v) for v in stats[i])
+            bottom = y1 + y + bh
+            # trees/backdrop: a thin strip that ends near the horizon. Truck: sits lower, on the road.
+            if area < 0.004 * dark.size or bottom < 0.55 * h or bh < 0.08 * h:
+                continue
+            if best is None or area > best[3]:
+                best = (float(cents[i][0]), bottom, bh, area, (x, y1 + y, bw, bh))
+        if best is None:
+            return None
+        x, y, bw, bh = best[4]
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 255), 2)  # debug: truck box
+        return best[:3]
+
+    def truck_step(self, hsv, frame, t):
+        """WAIT_TRUCK: stand still at the T until the truck shows up.
+        FOLLOW_TRUCK: steer toward it at follow_speed; stop if too close; PID again once it's gone."""
+        h, w = hsv.shape[:2]
+        truck = self.find_truck(hsv, frame)
+        tw = Twist()
+        if truck is not None:
+            self.truck_last_seen = t
+        if self.state == 'WAIT_TRUCK':
+            self.truck_info = 'truck: seen' if truck else f'truck: waiting {t - self.wait_start:.0f}s'
+            if truck is not None:
+                self.state = 'FOLLOW_TRUCK'
+                self.get_logger().info('truck spotted: following')
+            elif t - self.wait_start > self.p('truck_wait_max'):
+                self.state, self.truck_done = 'DRIVE', True
+                self.get_logger().warn('truck wait timed out, back to PID')
+            return tw
+        # FOLLOW_TRUCK
+        if truck is None:
+            self.truck_info = 'truck: lost'
+            if t - self.truck_last_seen > self.p('truck_lost'):
+                self.state, self.truck_done = 'DRIVE', True
+                self.get_logger().info('truck gone: back to PID')
+            return tw
+        cx, bottom, _ = truck
+        if bottom > self.p('truck_close') * h:
+            self.truck_info = 'truck: TOO CLOSE'
+            return tw
+        err = (cx - w / 2) / (w / 2)
+        tw.linear.x = self.p('follow_speed')
+        tw.angular.z = float(np.clip(-self.p('follow_kp') * err, -self.p('max_turn'), self.p('max_turn')))
+        self.truck_info = 'truck: following'
+        return tw
 
     def record(self, raw, tw):
         if tw.linear.x <= 0:  # only learn from driving forward
@@ -246,6 +378,11 @@ class Driver(Node):
         label = f'{self.state} | sec {self.section}: {self.mode()}'
         label += ' | PURPLE' if purple else ''
         label += f' | red {self.red_frac * 100:.1f}%' + (' STOP' if red else '')
+        label += f' | boards {self.boards}'
+        if self.state == 'WAIT_PED':
+            label += ' | ' + self.ped_status
+        if self.state in ('WAIT_TRUCK', 'FOLLOW_TRUCK'):
+            label += ' | ' + self.truck_info
         if self.writer is not None and self.mode() == 'teleop':
             label += f' | REC {self.n}'
         cv2.putText(frame, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
