@@ -60,9 +60,10 @@ class Driver(Node):
             'ped_min_area': 0.002,  # moving blob must cover this fraction of the image to count as the pedestrian
             'ped_side': 0.2,        # 'middle' band half-width (fraction of image width): inside = in front of the robot
             # clue boards (blue frame) as landmarks
-            'board_frac': 0.01,     # blue must cover this fraction of the image for a board to count as 'passing'
+            'board_frac': 0.02,     # blue must cover this fraction of a SIDE camera image for a board to count as 'passing'
+            'side_cams': True,      # count boards with the left/right cameras (False = old front-camera counting)
             # truck: wait at the T junction, then follow it
-            'truck_after_board': 2, # start waiting for the truck once this many boards have gone by (0 = never)
+            'truck_after_board': 3, # start waiting for the truck once this many boards have gone by (0 = never)
             'truck_delay': 0.0,     # seconds of PID after that board before stopping (creep up to the T)
             'truck_wait_max': 25.0, # give up waiting for the truck after this (one truck lap is ~14 s)
             'follow_speed': 0.4,    # keep below the truck's 0.5 m/s
@@ -88,8 +89,10 @@ class Driver(Node):
         self.seen_motion = False
         self.prev_gray = None
         self.ped_x, self.ped_status, self.ped_crossed = None, '', False
-        self.boards, self.board_on, self.board_off = 0, 0, 0
-        self.board_visible = False
+        self.boards = 0
+        # one board counter per camera: [frames seen, frames not seen, currently visible]
+        self.counters = {'front': [0, 0, False], 'left': [0, 0, False], 'right': [0, 0, False]}
+        self.side_view = {'left': None, 'right': None}  # latest small side images for the debug window
         self.truck_trigger_t, self.truck_done = None, False
         self.truck_last_seen, self.truck_info = 0.0, ''
         self.writer, self.out, self.n = None, None, 0
@@ -97,6 +100,9 @@ class Driver(Node):
         self.cmd = self.create_publisher(Twist, '/cmd_vel', 1)
         self.create_subscription(Twist, '/teleop_cmd', self.on_teleop, 1)
         self.create_subscription(Image, '/camera/image_raw', self.on_image, 1)
+        # Side cameras (custom robot). Need the ros_gz_bridge command running for these topics.
+        self.create_subscription(Image, '/left_camera/image_raw', lambda m: self.on_side(m, 'left'), 1)
+        self.create_subscription(Image, '/right_camera/image_raw', lambda m: self.on_side(m, 'right'), 1)
         self.get_logger().info(f'starting in section {self.section}: {self.mode()}')
 
     # ---------- helpers ----------
@@ -141,7 +147,8 @@ class Driver(Node):
                 self.purple_frames, self.ignore_purple_until = 0, t + 3.0
                 self.get_logger().info(f'purple line -> section {self.section}: {self.mode()}')
 
-        self.count_boards(hsv)
+        if not self.p('side_cams'):
+            self.count_boards(hsv, 'front')
 
         # Truck: after board N, creep for truck_delay s, then stop at the T and wait for the truck.
         if (not self.truck_done and self.truck_trigger_t is None and self.p('truck_after_board') > 0
@@ -283,19 +290,27 @@ class Driver(Node):
             return True
         return self.ped_crossed and self.ped_x is not None and not middle
 
-    def count_boards(self, hsv):
+    def on_side(self, msg, side):
+        """Side cameras only count clue boards (and feed the debug window)."""
+        small = cv2.resize(self.br.imgmsg_to_cv2(msg, 'bgr8'), (320, 180))
+        if self.p('side_cams'):
+            self.count_boards(cv2.cvtColor(small, cv2.COLOR_BGR2HSV), side)
+        self.side_view[side] = small
+
+    def count_boards(self, hsv, cam):
         """Clue boards have a saturated blue frame. Count one each time a big blue patch
-        has been in view (3+ frames) and then leaves view (5+ frames)."""
+        has been in this camera's view (3+ frames) and then leaves it (5+ frames)."""
         blue = cv2.inRange(hsv, (105, 150, 50), (130, 255, 255))
         now = cv2.countNonZero(blue) > self.p('board_frac') * blue.size
-        self.board_on = self.board_on + 1 if now else 0
-        self.board_off = self.board_off + 1 if not now else 0
-        if not self.board_visible and self.board_on >= 3:
-            self.board_visible = True
-        elif self.board_visible and self.board_off >= 5:
-            self.board_visible = False
+        c = self.counters[cam]
+        c[0] = c[0] + 1 if now else 0
+        c[1] = c[1] + 1 if not now else 0
+        if not c[2] and c[0] >= 3:
+            c[2] = True
+        elif c[2] and c[1] >= 5:
+            c[2] = False
             self.boards += 1
-            self.get_logger().info(f'passed clue board #{self.boards}')
+            self.get_logger().info(f'passed clue board #{self.boards} ({cam} camera)')
 
     def find_truck(self, hsv, frame):
         """Biggest near-black blob below the horizon. Returns (centre_x, bottom_y, height) or None."""
@@ -386,7 +401,18 @@ class Driver(Node):
         if self.writer is not None and self.mode() == 'teleop':
             label += f' | REC {self.n}'
         cv2.putText(frame, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-        cv2.imshow('driver', cv2.resize(frame, (640, 360)))
+        view = cv2.resize(frame, (640, 360))
+        if self.p('side_cams'):  # left | right camera strip under the main view, board-seen in green
+            tiles = []
+            for side in ('left', 'right'):
+                img = self.side_view[side]
+                tile = np.zeros((180, 320, 3), np.uint8) if img is None else img.copy()
+                seen = self.counters[side][2]
+                txt = f'{side}: ' + ('no image (bridge running?)' if img is None else ('BOARD' if seen else '-'))
+                cv2.putText(tile, txt, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0) if seen else (0, 255, 255), 1)
+                tiles.append(tile)
+            view = np.vstack([view, np.hstack(tiles)])
+        cv2.imshow('driver', view)
         cv2.waitKey(1)
 
 
