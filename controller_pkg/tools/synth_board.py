@@ -3,7 +3,8 @@
  
 Reproduces the sim's board: blue box 0.20 x 0.16 m, printed face 0.15 x 0.10 m (600x400 texture),
 pure-blue text, white banner, all darkened by lighting. The texture is JPEG round-tripped like
-the generator's cv2.imwrite. Later, the training-data script should import render_view from here.
+the generator's cv2.imwrite. The camera is level by default in its own yaw; pitch_deg tilts it
+down like the URDF's side cameras (10 deg).
 """
 import numpy as np
 import cv2
@@ -43,21 +44,23 @@ def render_face(type_word, value, banner=None):
     return cv2.imdecode(cv2.imencode(".jpg", face)[1], cv2.IMREAD_COLOR)
  
  
-def _project(pts_tex, d, phi, lateral, f, W, H):
+def _project(pts_tex, d, phi, lateral, f, W, H, pitch=0.0):
     lx = (pts_tex[:, 0] - TEX_W / 2) * M_PER_PX
     ly = (pts_tex[:, 1] - TEX_H / 2) * M_PER_PX
     c, s = np.cos(phi), np.sin(phi)
     X, Y, Z = lateral + c * lx, (CAM_Z - FACE_CENTRE_Z) + ly, d - s * lx
+    if pitch:   # camera tilted down by `pitch`: points straight ahead move UP in the image
+        Y, Z = Y * np.cos(pitch) - Z * np.sin(pitch), Y * np.sin(pitch) + Z * np.cos(pitch)
     return np.float32(np.stack([f * X / Z + W / 2, f * Y / Z + H / 2], axis=1))
  
  
 def render_view(face, d=0.3, phi_deg=0.0, lateral=0.0, light=0.55, noise=1.8, blur=0.6,
-                W=960, H=540, f=572.0, seed=None):
+                pitch_deg=10.0, W=960, H=540, f=572.0, seed=None):
     """Return (image BGR, true face quad TL TR BR BL in image px).
  
-    d: distance along the optical axis to the face centre (m). phi_deg: board yaw relative to
-    facing the camera. lateral: sideways offset of the face centre (m). noise: gaussian sigma in
-    8-bit levels (rule minimum 0.007 is about 1.8).
+    d: distance along the (level) optical axis to the face centre (m). phi_deg: board yaw relative
+    to facing the camera. lateral: sideways offset of the face centre (m). noise: gaussian sigma in
+    8-bit levels (rule minimum 0.007 is about 1.8). pitch_deg: camera tilt down.
     """
     rng = np.random.default_rng(seed)
     x0, y0, x1, y1 = CANVAS
@@ -66,14 +69,14 @@ def render_view(face, d=0.3, phi_deg=0.0, lateral=0.0, light=0.55, noise=1.8, bl
     canvas[-y0:-y0 + TEX_H, -x0:-x0 + TEX_W] = face
     canvas = (canvas * light).astype(np.uint8)
  
-    phi = np.deg2rad(phi_deg)
+    phi, pitch = np.deg2rad(phi_deg), np.deg2rad(pitch_deg)
     box = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
     src = np.float32([[0, 0], [x1 - x0, 0], [x1 - x0, y1 - y0], [0, y1 - y0]])
-    M = cv2.getPerspectiveTransform(src, _project(box, d, phi, lateral, f, W, H))
+    M = cv2.getPerspectiveTransform(src, _project(box, d, phi, lateral, f, W, H, pitch))
     img = cv2.warpPerspective(canvas, M, (W, H), borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 110, 40))
     if blur > 0:
         img = cv2.GaussianBlur(img, (0, 0), blur)
     img = np.clip(img + rng.normal(0, noise, img.shape), 0, 255).astype(np.uint8)
-    quad = _project(np.float32([[0, 0], [TEX_W, 0], [TEX_W, TEX_H], [0, TEX_H]]), d, phi, lateral, f, W, H)
-    return img, quad
+    corners = np.float32([[0, 0], [TEX_W, 0], [TEX_W, TEX_H], [0, TEX_H]])
+    return img, _project(corners, d, phi, lateral, f, W, H, pitch)
  

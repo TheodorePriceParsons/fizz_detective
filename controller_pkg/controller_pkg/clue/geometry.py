@@ -19,7 +19,7 @@ import numpy as np
  
 # ---------------------------------------------------------------- colour
 # Same blue range as driver.count_boards (OpenCV HSV, H 0-180).
-BLUE_LO = (105, 150, 50)
+BLUE_LO = (100, 100, 50)
 BLUE_HI = (130, 255, 255)
 _K3 = np.ones((3, 3), np.uint8)
  
