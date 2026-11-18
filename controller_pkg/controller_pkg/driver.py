@@ -39,7 +39,8 @@ class Driver(Node):
         super().__init__('driver', parameter_overrides=[Parameter('use_sim_time', value=True)])
         defaults = {
             'speed': 0.3, 'kp': 1.2, 'kd': 0.4, 'max_turn': 1.5,   # PID
-            'sat_max': 40, 'val_min': 50, 'roi': 0.6,              # road mask
+            'sat_max': 40, 'val_min': 50, 'roi': 0.6,              # road mask (roi = top of the part of the image PID looks at; bigger = look closer)
+            'lane_bias': 0.0,     # + = hold the robot right of the road centre (e.g. 0.15), - = left
             'strip': 0.85,        # line detection only looks below this fraction of the image height
             'line_frac': 0.05,    # fraction of that strip that must be line-coloured to count
             'sections': ['pid', 'teleop'],  # mode before 1st purple line, after 1st, after 2nd, ...
@@ -47,6 +48,7 @@ class Driver(Node):
             'red_strip': 0.85,    # red crosswalk line is looked for below this fraction of the image (earlier than purple)
             'red_frac': 0.02,     # fraction of that strip that must be red to stop
             'cross_speed': 0.8,  # speed while crossing the crosswalk after the pedestrian has passed
+            'approach_speed': 0.3,  # slow to this when red is in view (crosswalk coming) so the stop at the line is accurate
             'cross_time': 3.0,    # seconds to drive at cross_speed (no stopping) after 'go'
             'max_wait': 15.0,     # give up waiting for the pedestrian after this many seconds
             'road_v_max': 120,    # asphalt is dark grey; brighter greys (cars) are NOT road
@@ -58,16 +60,45 @@ class Driver(Node):
             'veh_max_wait': 10.0, # never sit in WAIT_VEHICLE longer than this
             # pedestrian (robot is stopped at the crosswalk, so moving pixels = pedestrian)
             'ped_min_area': 0.002,  # moving blob must cover this fraction of the image to count as the pedestrian
+            'ped_center': 0.5,      # where 'in front of the robot' is, as a fraction of image width (0 = left edge, 0.5 = centre)
             'ped_side': 0.2,        # 'middle' band half-width (fraction of image width): inside = in front of the robot
             # clue boards (blue frame) as landmarks
             'board_frac': 0.02,     # blue must cover this fraction of a SIDE camera image for a board to count as 'passing'
             'side_cams': True,      # count boards with the left/right cameras (False = old front-camera counting)
+            'board_on': 2,          # frames in a row the board must be seen (fewer = still counts at high speed)
+            'board_gap': 1.5,       # ignore any new board for this many seconds after counting one (stops double counts)
+            'board_alternate': False,  # True = next board must be on the OTHER side from the last one
             # truck: wait at the T junction, then follow it
             'truck_after_board': 3, # start waiting for the truck once this many boards have gone by (0 = never)
             'truck_delay': 0.0,     # seconds of PID after that board before stopping (creep up to the T)
             'truck_wait_max': 25.0, # give up waiting for the truck after this (one truck lap is ~14 s)
-            'follow_speed': 0.4,    # keep below the truck's 0.5 m/s
-            'follow_kp': 1.5,       # steering gain toward the truck
+            # SHIFT: sidestep right after board 3, before stopping to wait for the truck.
+            # Turn out for shift_turn s, straight for shift_straight s, turn back for shift_turn s.
+            'shift_ang': 1.0,       # + = shift LEFT, - = shift RIGHT (0 = no shift)
+            'shift_turn': 0.5,
+            'shift_straight': 0.5,
+            'shift_speed': 0.3,
+            'shift_rot': 0.3,       # then spin in place this many seconds (+ = LEFT, - = right) to face the truck loop
+            'rot_speed': 1.0,       #   spin rate (rad/s)
+            'truck_go_delay': 1.0,  # after first seeing the truck, wait this long (let it get ahead) before turning
+            # Board avoidance (front camera): a big blue board frame low in the image = about to hit it.
+            'avoid_frac': 0.04,     # blue blob must cover this fraction of the front image
+            'avoid_gain': 1.2,      # extra turn rate (rad/s) away from the board
+            'avoid_slow': 0.2,      # cap forward speed at this while avoiding
+            'turn_speed': 0.3,      # scripted turn through the T: forward speed
+            'turn_straight': 0.5,   #   seconds straight ahead first (into the junction)
+            'turn_time': 1.5,       #   then seconds turning
+            'turn_ang': 1.0,        #   turn rate (rad/s): + = LEFT, - = RIGHT
+            'follow_speed': 0.4,    # after the turn: PID steering, capped at this speed (truck does 0.5)
+            'follow_time': 25.0,    # fallback: give up looking for the exit after this many s of following
+            # EXIT: leave the truck loop. The exit branch opens on the LEFT: road appears in the front image's lower-left box.
+            'exit_min_time': 5.0,   # only look for the exit this many s after FOLLOW_TRUCK starts
+            'exit_road': 0.4,       # road must fill this fraction of that box
+            'exit_box': [0.55, 0.85, 0.0, 0.3],  # the box: top, bottom, left, right (fractions of the front image)
+            'exit_straight': 0.6,   # then seconds straight (front cam sees the opening early)
+            'exit_time': 1.5,       #   then seconds turning
+            'exit_ang': 1.0,        #   turn rate (rad/s): + = LEFT
+            'exit_speed': 0.3,
             'truck_close': 0.8,     # stop if the truck's bottom edge is below this fraction of the image (too close)
             'truck_lost': 1.5,      # truck out of sight this long (s) -> back to PID
         }
@@ -93,8 +124,12 @@ class Driver(Node):
         # one board counter per camera: [frames seen, frames not seen, currently visible]
         self.counters = {'front': [0, 0, False], 'left': [0, 0, False], 'right': [0, 0, False]}
         self.side_view = {'left': None, 'right': None}  # latest small side images for the debug window
+        self.last_board_t, self.last_board_cam = -1e9, None
         self.truck_trigger_t, self.truck_done = None, False
         self.truck_last_seen, self.truck_info = 0.0, ''
+        self.truck_seen_t, self.turn_start, self.follow_start = None, 0.0, 0.0
+        self.shift_start = 0.0
+        self.exit_start = 0.0
         self.writer, self.out, self.n = None, None, 0
 
         self.cmd = self.create_publisher(Twist, '/cmd_vel', 1)
@@ -157,8 +192,8 @@ class Driver(Node):
             self.get_logger().info(f'board {self.boards} passed: truck section')
         if (self.state == 'DRIVE' and self.mode() == 'pid' and self.truck_trigger_t is not None
                 and not self.truck_done and t - self.truck_trigger_t > self.p('truck_delay')):
-            self.state, self.wait_start = 'WAIT_TRUCK', t
-            self.get_logger().info('at the T: waiting for the truck')
+            self.state, self.shift_start = 'SHIFT', t
+            self.get_logger().info('board 3 passed: shifting over before the T')
 
         # Red crosswalk line (only while PID is driving).
         # (also overrides WAIT_VEHICLE: the pedestrian's dark clothes can trip the vehicle check first)
@@ -174,7 +209,7 @@ class Driver(Node):
             self.state, self.veh_clear_since, self.veh_wait_start = 'WAIT_VEHICLE', None, t
             self.get_logger().info('vehicle ahead: stopping')
 
-        if self.state in ('WAIT_TRUCK', 'FOLLOW_TRUCK'):
+        if self.state in ('SHIFT', 'WAIT_TRUCK', 'T_TURN', 'FOLLOW_TRUCK', 'EXIT'):
             tw = self.truck_step(hsv, frame, t)
         elif self.state == 'WAIT_VEHICLE':
             tw = Twist()
@@ -198,10 +233,14 @@ class Driver(Node):
             tw = self.pid(hsv, frame)
             if crossing and tw.linear.x > 0:
                 tw.linear.x = self.p('cross_speed')
+            elif near_cross and tw.linear.x > 0:  # crosswalk coming up: slow down before the red line
+                tw.linear.x = min(tw.linear.x, self.p('approach_speed'))
         else:  # 'teleop': you drive, we record
             tw = self.teleop
             self.record(raw, tw)
 
+        if self.mode() == 'pid' and tw.linear.x > 0:
+            tw = self.avoid_board(hsv, frame, tw)
         self.cmd.publish(tw)
         self.show(frame, purple, red)
 
@@ -223,7 +262,7 @@ class Driver(Node):
         if cv2.countNonZero(mask) > 0.05 * mask.size:
             M = cv2.moments(mask, binaryImage=True)
             cx = M['m10'] / M['m00']
-            err = (cx - w / 2) / (w / 2)  # -1 road is left ... +1 road is right
+            err = (cx - w / 2) / (w / 2) + self.p('lane_bias')  # -1 road is left ... +1 road is right
             turn = -(self.p('kp') * err + self.p('kd') * (err - self.prev_err))
             tw.linear.x = self.p('speed')
             tw.angular.z = float(np.clip(turn, -self.p('max_turn'), self.p('max_turn')))
@@ -272,11 +311,12 @@ class Driver(Node):
         self.prev_gray = gray
 
         band = self.p('ped_side') * w
-        middle = self.ped_x is not None and abs(self.ped_x - w / 2) <= band
+        mid = self.p('ped_center') * w
+        middle = self.ped_x is not None and abs(self.ped_x - mid) <= band
         if middle:
             self.ped_crossed = True  # he is walking in front of us right now
-        cv2.line(frame, (int(w / 2 - band), 0), (int(w / 2 - band), h), (255, 0, 255), 1)  # middle band edges
-        cv2.line(frame, (int(w / 2 + band), 0), (int(w / 2 + band), h), (255, 0, 255), 1)
+        cv2.line(frame, (int(mid - band), 0), (int(mid - band), h), (255, 0, 255), 1)  # middle band edges
+        cv2.line(frame, (int(mid + band), 0), (int(mid + band), h), (255, 0, 255), 1)
         if not self.seen_motion:
             self.ped_status = 'ped: not seen'
         elif middle:
@@ -299,18 +339,44 @@ class Driver(Node):
 
     def count_boards(self, hsv, cam):
         """Clue boards have a saturated blue frame. Count one each time a big blue patch
-        has been in this camera's view (3+ frames) and then leaves it (5+ frames)."""
+        has been in this camera's view (board_on+ frames) and then leaves it (5+ frames)."""
         blue = cv2.inRange(hsv, (105, 150, 50), (130, 255, 255))
         now = cv2.countNonZero(blue) > self.p('board_frac') * blue.size
         c = self.counters[cam]
         c[0] = c[0] + 1 if now else 0
         c[1] = c[1] + 1 if not now else 0
-        if not c[2] and c[0] >= 3:
+        if not c[2] and c[0] >= self.p('board_on'):
             c[2] = True
         elif c[2] and c[1] >= 5:
             c[2] = False
-            self.boards += 1
-            self.get_logger().info(f'passed clue board #{self.boards} ({cam} camera)')
+            t = self.now()
+            if t - self.last_board_t < self.p('board_gap'):
+                self.get_logger().info(f'{cam}: board ignored (only {t - self.last_board_t:.1f}s after the last one)')
+            elif self.p('board_alternate') and cam == self.last_board_cam:
+                self.get_logger().info(f'{cam}: board ignored (same side as the last one)')
+            else:
+                self.boards += 1
+                self.last_board_t, self.last_board_cam = t, cam
+                self.get_logger().info(f'passed clue board #{self.boards} ({cam} camera)')
+
+    def avoid_board(self, hsv, frame, tw):
+        """Safety layer on top of EVERY driving state (PID, sidestep, T turn, follow, exit):
+        if a clue board's blue frame is big and low in the front view, steer away from it and slow down."""
+        h, w = hsv.shape[:2]
+        blue = cv2.inRange(hsv, (105, 150, 50), (130, 255, 255))
+        n, labels, stats, cents = cv2.connectedComponentsWithStats(blue, connectivity=8)
+        if n <= 1:
+            return tw
+        i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        x, y, bw, bh, area = (int(v) for v in stats[i])
+        if area < self.p('avoid_frac') * blue.size or y + bh < 0.5 * h:
+            return tw
+        side = 1.0 if cents[i][0] < w / 2 else -1.0       # board on the left -> turn right (negative)
+        tw.angular.z = float(np.clip(tw.angular.z - side * self.p('avoid_gain'), -self.p('max_turn'), self.p('max_turn')))
+        tw.linear.x = min(tw.linear.x, self.p('avoid_slow'))
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 255, 0), 2)
+        cv2.putText(frame, 'AVOID BOARD', (x, max(y - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+        return tw
 
     def find_truck(self, hsv, frame):
         """Biggest near-black blob below the horizon. Returns (centre_x, bottom_y, height) or None."""
@@ -335,38 +401,103 @@ class Driver(Node):
         cv2.rectangle(frame, (x, y), (x + bw, y + bh), (255, 0, 255), 2)  # debug: truck box
         return best[:3]
 
+    def left_branch(self, hsv, frame):
+        """Fraction of the front image's lower-left box that is road (grey/white) = a road opening on the left."""
+        h, w = hsv.shape[:2]
+        t0, b0, l0, r0 = self.p('exit_box')
+        y1, y2, x1, x2 = int(t0 * h), int(b0 * h), int(l0 * w), int(r0 * w)
+        box = hsv[y1:y2, x1:x2]
+        v = box[..., 2]
+        road = (box[..., 1] <= self.p('sat_max')) & (((v >= self.p('val_min')) & (v <= self.p('road_v_max'))) | (v >= 200))
+        frac = float(np.count_nonzero(road)) / road.size
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0) if frac > self.p('exit_road') else (0, 128, 255), 1)
+        return frac
+
     def truck_step(self, hsv, frame, t):
-        """WAIT_TRUCK: stand still at the T until the truck shows up.
-        FOLLOW_TRUCK: steer toward it at follow_speed; stop if too close; PID again once it's gone."""
+        """WAIT_TRUCK: stand still at the T until the truck shows up, then give it truck_go_delay s.
+        T_TURN: scripted turn through the junction (no camera steering, so no chasing the truck into the sign).
+        FOLLOW_TRUCK: normal PID steering, speed capped below the truck's, stop if it's too close.
+        EXIT: once road opens up on the left of the front image, scripted left turn out of the loop."""
         h, w = hsv.shape[:2]
         truck = self.find_truck(hsv, frame)
         tw = Twist()
         if truck is not None:
             self.truck_last_seen = t
+        if self.state == 'SHIFT':
+            e, a = t - self.shift_start, self.p('shift_ang')
+            t1, t2 = self.p('shift_turn'), self.p('shift_straight')
+            tr = self.p('shift_rot')
+            if a == 0:
+                t1 = t2 = 0.0
+            if e >= 2 * t1 + t2 + abs(tr):
+                self.state, self.wait_start = 'WAIT_TRUCK', t
+                self.get_logger().info('at the T: waiting for the truck')
+                return tw
+            if e >= 2 * t1 + t2:              # spin in place toward the loop
+                tw.angular.z = float(np.sign(tr) * self.p('rot_speed'))
+                self.truck_info = f'rotate {e - 2 * t1 - t2:.1f}s'
+                return tw
+            tw.linear.x = self.p('shift_speed')
+            if e < t1:
+                tw.angular.z = float(a)       # turn out
+            elif e >= t1 + t2:
+                tw.angular.z = -float(a)      # turn back to the original heading
+            self.truck_info = f'shift {"left" if a > 0 else "right"} {e:.1f}s'
+            return tw
         if self.state == 'WAIT_TRUCK':
-            self.truck_info = 'truck: seen' if truck else f'truck: waiting {t - self.wait_start:.0f}s'
-            if truck is not None:
-                self.state = 'FOLLOW_TRUCK'
-                self.get_logger().info('truck spotted: following')
-            elif t - self.wait_start > self.p('truck_wait_max'):
+            if truck is not None and self.truck_seen_t is None:
+                self.truck_seen_t = t
+                self.get_logger().info('truck spotted')
+            if self.truck_seen_t is not None:
+                self.truck_info = f'truck: seen, going in {self.p("truck_go_delay") - (t - self.truck_seen_t):.1f}s'
+                if t - self.truck_seen_t > self.p('truck_go_delay'):
+                    self.state, self.turn_start = 'T_TURN', t
+                    self.get_logger().info('turning through the T')
+            else:
+                self.truck_info = f'truck: waiting {t - self.wait_start:.0f}s'
+                if t - self.wait_start > self.p('truck_wait_max'):
+                    self.state, self.truck_done = 'DRIVE', True
+                    self.get_logger().warn('truck wait timed out, back to PID')
+            return tw
+        if self.state == 'T_TURN':
+            e = t - self.turn_start
+            if e < self.p('turn_straight'):
+                tw.linear.x = self.p('turn_speed')
+            elif e < self.p('turn_straight') + self.p('turn_time'):
+                tw.linear.x, tw.angular.z = self.p('turn_speed'), float(self.p('turn_ang'))
+            else:
+                self.state, self.follow_start = 'FOLLOW_TRUCK', t
+                self.get_logger().info('turn done: following truck with PID')
+            self.truck_info = f'truck: scripted turn {e:.1f}s'
+            return tw
+        if self.state == 'EXIT':
+            e = t - self.exit_start
+            if e < self.p('exit_straight'):
+                tw.linear.x = self.p('exit_speed')
+            elif e < self.p('exit_straight') + self.p('exit_time'):
+                tw.linear.x, tw.angular.z = self.p('exit_speed'), float(self.p('exit_ang'))
+            else:
                 self.state, self.truck_done = 'DRIVE', True
-                self.get_logger().warn('truck wait timed out, back to PID')
+                self.get_logger().info('out of the loop: normal driving')
+            self.truck_info = f'exit turn {e:.1f}s'
             return tw
         # FOLLOW_TRUCK
-        if truck is None:
-            self.truck_info = 'truck: lost'
-            if t - self.truck_last_seen > self.p('truck_lost'):
-                self.state, self.truck_done = 'DRIVE', True
-                self.get_logger().info('truck gone: back to PID')
+        followed = t - self.follow_start
+        branch = self.left_branch(hsv, frame)
+        if followed > self.p('exit_min_time') and branch > self.p('exit_road'):
+            self.state, self.exit_start = 'EXIT', t
+            self.get_logger().info(f'road opening on the left ({branch * 100:.0f}%): turning out of the loop')
             return tw
-        cx, bottom, _ = truck
-        if bottom > self.p('truck_close') * h:
+        if followed > self.p('follow_time'):
+            self.state, self.truck_done = 'DRIVE', True
+            self.get_logger().info('truck section done: normal driving')
+            return self.pid(hsv, frame)
+        if truck is not None and truck[1] > self.p('truck_close') * h:
             self.truck_info = 'truck: TOO CLOSE'
             return tw
-        err = (cx - w / 2) / (w / 2)
-        tw.linear.x = self.p('follow_speed')
-        tw.angular.z = float(np.clip(-self.p('follow_kp') * err, -self.p('max_turn'), self.p('max_turn')))
-        self.truck_info = 'truck: following'
+        tw = self.pid(hsv, frame)
+        tw.linear.x = min(tw.linear.x, self.p('follow_speed'))
+        self.truck_info = f'truck: following (PID) | left road {branch * 100:.0f}%' + (' armed' if followed > self.p('exit_min_time') else '')
         return tw
 
     def record(self, raw, tw):
@@ -396,7 +527,7 @@ class Driver(Node):
         label += f' | boards {self.boards}'
         if self.state == 'WAIT_PED':
             label += ' | ' + self.ped_status
-        if self.state in ('WAIT_TRUCK', 'FOLLOW_TRUCK'):
+        if self.state in ('SHIFT', 'WAIT_TRUCK', 'T_TURN', 'FOLLOW_TRUCK', 'EXIT'):
             label += ' | ' + self.truck_info
         if self.writer is not None and self.mode() == 'teleop':
             label += f' | REC {self.n}'
